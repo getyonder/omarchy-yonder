@@ -1,0 +1,406 @@
+#!/usr/bin/env bash
+# Yonder's share actions for Omarchy: the rows under Share in Omarchy's menu
+# and the "Send with Yonder" action in Files. The panel's "Share and Files"
+# setting runs `apply`; the rows and the Files action run `menu` and `files`,
+# which hand the panel what to send and open it. Run as `bash share ...`.
+#
+#   share apply off|beside|takeover   make the menu file and Files agree with the setting;
+#                                     prints "files-restart" when Files is running and
+#                                     shows the change only after it is started again
+#   share remove                      as "apply off", and clear what is left in the runtime folder
+#   share status                      print which of the three the menu file holds
+#   share menu clipboard|file|folder|receive
+#   share files PATH...               hand these to the panel
+#   share clipboard-file              the clipboard's text as a file: prints its path and size
+#   share take                        print what was handed over, and remove it
+#   share pick TITLE                  run the file chooser for the panel and print the paths;
+#                                     status 1 nothing chosen, 2 no chooser, 3 not a list of paths
+#
+# It changes two places outside the plugin's folder, and only on `apply` and
+# `remove`: one marked block of lines in the user's menu file, and the files
+# yonder_send.py and localsend.py in the user's Files extensions folder.
+set -uo pipefail
+
+id=org.getyonder.yonder
+plugin=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+menu_file="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/extensions/omarchy-menu.jsonc"
+files_dir="${XDG_DATA_HOME:-$HOME/.local/share}/nautilus-python/extensions"
+files_action="$files_dir/yonder_send.py"
+localsend="$files_dir/localsend.py"
+aside="$localsend.yonder-aside"
+
+# The block of the menu file that is this script's. Nothing outside the two
+# marks is ever changed.
+mark_begin="// >>> $id"
+mark_end="// <<< $id"
+# The icon of the row "Send with Yonder": the Nerd Font's "send" (U+F048A),
+# written as its bytes so that it does not depend on the locale.
+send_glyph=$'\xf3\xb0\x92\x8a'
+# A handover older than this was never collected, and is not shown.
+handover_seconds=60
+
+die() {
+  echo "share: $*" >&2
+  exit 1
+}
+
+# sorry tells the user of a failure that has no window to show it in.
+sorry() {
+  echo "share: $*" >&2
+  if command -v omarchy-notification-send >/dev/null 2>&1; then
+    omarchy-notification-send -g "" -u critical "Could not share" "$*"
+  fi
+  exit 1
+}
+
+handover_file() {
+  [[ -n ${XDG_RUNTIME_DIR:-} && -d $XDG_RUNTIME_DIR ]] || return 1
+  printf '%s\n' "$XDG_RUNTIME_DIR/$id.send"
+}
+
+# ---- The menu file ----
+
+# row prints one line of the block: a menu row that runs this script when the
+# plugin is installed and Omarchy's own command (if any) when it has been
+# removed, so that a block left behind does no harm.
+row() {
+  local key=$1 fields=$2 ours=$3 theirs=$4 action
+  action='h=\"${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins/'"$id"'/share\"; if [ -f \"$h\" ]; then exec bash \"$h\" '"$ours"'; '
+  [[ -n $theirs ]] && action+="else exec $theirs; "
+  action+='fi'
+  printf '  "%s": {%s"action":"%s"},\n' "$key" "$fields" "$action"
+}
+
+takeover_fields() {
+  printf '"icon":"%s","label":"%s","description":"Yonder",' "$1" "$2"
+}
+
+# block prints the block for a mode; "new" in the first mark says that the
+# menu file was made by this script, so "off" may delete it again.
+block() {
+  local mode=$1 made=$2 installed
+  installed='[ -f \"${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins/'"$id"'/share\" ]'
+  printf '  %s (%s%s): written by the "Share and Files" setting of the Yonder plugin, which also removes it. Change the setting, not these lines.\n' \
+    "$mark_begin" "$mode" "$made"
+  if [[ $mode == beside ]]; then
+    row trigger.share.yonder "\"icon\":\"$send_glyph\",\"label\":\"Send with Yonder\",\"when\":\"$installed\"," "menu file" ""
+  else
+    # The shell puts a row of the user's file in place of its own whole, so
+    # each row carries the icon and label of Omarchy's row again (as its
+    # default menu file has them, the icons as their bytes). The description
+    # shows in a search of the menu; a row has no other place for a word.
+    row trigger.share.clipboard "$(takeover_fields $'\xef\x81\xbf' Clipboard)" "menu clipboard" "omarchy-menu-share clipboard"
+    row trigger.share.file "$(takeover_fields $'\xee\xa9\xbb' File)" "menu file" "omarchy-menu-share file"
+    row trigger.share.folder "$(takeover_fields $'\xef\x84\x94' Folder)" "menu folder" "omarchy-menu-share folder"
+    row trigger.share.receive "$(takeover_fields $'\xf3\xb0\xa5\xa6' Receive)" "menu receive" "uwsm-app -- localsend"
+  fi
+  printf '  %s\n' "$mark_end"
+}
+
+# menu_marks checks that the file holds no block or one whole block, so that
+# a damaged pair of marks never has lines of the user's removed for it.
+menu_marks() {
+  awk -v b="$mark_begin" -v e="$mark_end" '
+    index($0, b) { if (open || blocks) bad = 1; open = 1; next }
+    index($0, e) { if (!open) bad = 1; open = 0; blocks++; next }
+    END { exit (bad || open) ? 1 : 0 }' "$menu_file"
+}
+
+# menu_mode prints the mode the file's block is for, or "off".
+menu_mode() {
+  local line
+  [[ -f $menu_file ]] || { echo off; return; }
+  line=$(grep -F -m1 -- "$mark_begin" "$menu_file") || { echo off; return; }
+  case $line in
+    *"$mark_begin (beside"*) echo beside ;;
+    *"$mark_begin (takeover"*) echo takeover ;;
+    *) echo unknown ;;
+  esac
+}
+
+apply_menu() {
+  local mode=$1 made="" rest next current
+  if [[ ! -e $menu_file ]]; then
+    [[ $mode == off ]] && return 0
+    mkdir -p "$(dirname "$menu_file")" || die "could not make the folder of $menu_file"
+    made=", new file"
+    rest=$'{\n}\n'
+  else
+    menu_marks || die "the Yonder marks in $menu_file are damaged; remove the lines between them, and the marks, by hand"
+    grep -F -- "$mark_begin" "$menu_file" | grep -qF ", new file)" && made=", new file"
+    rest=$(awk -v b="$mark_begin" -v e="$mark_end" '
+      index($0, b) { skip = 1; next }
+      index($0, e) { skip = 0; next }
+      !skip { print }
+      END { printf "x" }' "$menu_file") || die "could not read $menu_file"
+    # The x keeps the file's last blank lines through the $(...).
+    rest=${rest%x}
+  fi
+
+  if [[ $mode == off ]]; then
+    # A file this script made, with nothing else in it by now, goes again.
+    if [[ -n $made && -z $(tr -d '{}[:space:]' <<<"$rest") ]]; then
+      rm -f -- "$menu_file" || die "could not remove $menu_file"
+      return 0
+    fi
+    next=$rest
+  else
+    # The block goes straight after the opening brace. Every row ends in a
+    # comma, which the shell's reader allows before the closing brace, and a
+    # row of the user's own with the same id comes later and so wins.
+    next=$(BLOCK=$(block "$mode" "$made") awk '
+      !done && /^[[:space:]]*\{[[:space:]]*$/ { print; print ENVIRON["BLOCK"]; done = 1; next }
+      !done && !/^[[:space:]]*(\/\/.*)?$/ { exit 3 }
+      { print }
+      END { if (!done) exit 3; printf "x" }' < <(printf '%s' "$rest")) \
+      || die "$menu_file does not start with a line that holds only {, so the rows were not added"
+    next=${next%x}
+  fi
+
+  if [[ -e $menu_file ]]; then
+    current=$(cat -- "$menu_file"; printf x) || die "could not read $menu_file"
+    [[ $next == "${current%x}" ]] && return 0
+  fi
+  write_menu "$next"
+}
+
+# write_menu writes the menu file by way of a temporary file in the same
+# folder and a rename, so that a stop in the middle leaves the old file. A
+# link is followed to the file it names, so that it stays a link, and the
+# file keeps its mode.
+write_menu() {
+  local target dir part
+  target=$(readlink -f -- "$menu_file") || die "could not write $menu_file"
+  dir=$(dirname -- "$target")
+  part=$(mktemp "$dir/.omarchy-menu.XXXXXX") || die "could not write $menu_file"
+  { printf '%s' "$1" >"$part" \
+    && { [[ ! -e $target ]] || chmod --reference="$target" -- "$part"; } \
+    && mv -f -- "$part" "$target"; } || {
+    rm -f -- "$part"
+    die "could not write $menu_file"
+  }
+}
+
+# ---- Files ----
+
+# restore_localsend puts LocalSend's action back where "take over" put it
+# aside. One that came back by itself meanwhile is the one that stays.
+restore_localsend() {
+  [[ -e $aside ]] || return 0
+  if [[ ! -e $localsend ]]; then
+    mv -- "$aside" "$localsend" || die "could not put $localsend back"
+  elif cmp -s -- "$aside" "$localsend"; then
+    rm -f -- "$aside"
+  fi
+}
+
+# files_listing prints what decides the actions Files shows.
+files_listing() {
+  ls -A -- "$files_dir" 2>/dev/null
+  cksum -- "$files_action" 2>/dev/null
+}
+
+apply_files() {
+  local mode=$1
+  if [[ $mode == off ]]; then
+    rm -f -- "$files_action" || die "could not remove $files_action"
+    # Python's compiled copy of the action, and its folder if nothing else
+    # is in it.
+    rm -f -- "$files_dir"/__pycache__/yonder_send.*.pyc
+    rmdir -- "$files_dir/__pycache__" 2>/dev/null
+    restore_localsend
+    # The folders go only when "beside" or "take over" made them: rmdir
+    # refuses a folder that holds anything.
+    rmdir -- "$files_dir" "$(dirname "$files_dir")" 2>/dev/null
+    return 0
+  fi
+
+  mkdir -p "$files_dir" || die "could not make $files_dir"
+  if ! cmp -s -- "$plugin/files-action.py" "$files_action"; then
+    cp -- "$plugin/files-action.py" "$files_action" || die "could not write $files_action"
+  fi
+  if [[ $mode == takeover ]]; then
+    if [[ -e $localsend ]]; then
+      mv -- "$localsend" "$aside" || die "could not put $localsend aside"
+    fi
+  else
+    restore_localsend
+  fi
+}
+
+apply() {
+  case ${1:-} in
+    off | beside | takeover) ;;
+    *) die "apply needs off, beside or takeover" ;;
+  esac
+  local before
+  apply_menu "$1"
+  before=$(files_listing)
+  apply_files "$1"
+  # Files reads its extensions only when it starts.
+  if [[ $before != "$(files_listing)" ]] && pgrep -x nautilus >/dev/null 2>&1; then
+    echo files-restart
+  fi
+}
+
+# ---- Handing files to the panel ----
+
+# clipboard_file writes the clipboard's text to a file of its own in a new
+# folder only this user can read, and prints the file's path. Status 1 is a
+# clipboard with no text in it.
+clipboard_file() {
+  local dir file
+  dir=$(mktemp -d "${XDG_RUNTIME_DIR:-/tmp}/yonder-clipboard.XXXXXX") || return 2
+  file="$dir/clipboard.txt"
+  if wl-paste --type text >"$file" 2>/dev/null && [[ -s $file ]]; then
+    printf '%s\n' "$file"
+  else
+    rm -f -- "$file"
+    rmdir -- "$dir"
+    return 1
+  fi
+}
+
+# remove_clipboard_file deletes a file clipboard_file made, and its folder.
+remove_clipboard_file() {
+  [[ $1 == */yonder-clipboard.*/clipboard.txt ]] || return 0
+  rm -f -- "$1" && rmdir -- "${1%/*}" 2>/dev/null
+}
+
+# hand_over writes what is to be sent where the panel looks for it, and
+# opens the panel. A folder stands for the files in it, because Yonder sends
+# files only. The file is: "yonder-send 1", "files" or "clipboard", the
+# number of bytes, then one path on each line.
+hand_over() {
+  local kind=$1 target part bytes p f
+  local -a paths=()
+  shift
+  target=$(handover_file) || sorry "there is no runtime folder (XDG_RUNTIME_DIR)"
+
+  for p in "$@"; do
+    [[ $p == /* ]] || p="$PWD/$p"
+    if [[ -d $p ]]; then
+      while IFS= read -r -d '' f; do
+        [[ $f == *$'\n'* ]] || paths+=("$f")
+      done < <(find "$p" -type f -print0 2>/dev/null | sort -z)
+    elif [[ -f $p && $p != *$'\n'* ]]; then
+      paths+=("$p")
+    fi
+  done
+  ((${#paths[@]} > 0)) || sorry "there are no files to send"
+
+  bytes=$(printf '%s\0' "${paths[@]}" | xargs -0 stat -c %s -- 2>/dev/null | awk '{ sum += $1 } END { printf "%d\n", sum }')
+
+  part=$(umask 077 && mktemp "$target.XXXXXX") || sorry "could not write to the runtime folder"
+  {
+    printf 'yonder-send 1\n%s\n%s\n' "$kind" "$bytes"
+    printf '%s\n' "${paths[@]}"
+  } >"$part" && mv -f -- "$part" "$target" || {
+    rm -f -- "$part"
+    sorry "could not write to the runtime folder"
+  }
+
+  if [[ $(omarchy-shell shell summon "$id" '{}' 2>/dev/null) != ok ]]; then
+    rm -f -- "$target"
+    [[ $kind == clipboard ]] && remove_clipboard_file "${paths[0]}"
+    sorry "the Yonder icon is not in the bar, so its panel did not open"
+  fi
+}
+
+# take prints the handover and removes it. One nobody collected in time is
+# removed and not printed, and a clipboard file of it goes too.
+take() {
+  local target text age
+  target=$(handover_file) || return 0
+  [[ -f $target ]] || return 0
+  age=$(($(date +%s) - $(stat -c %Y -- "$target")))
+  text=$(cat -- "$target")
+  rm -f -- "$target"
+  if ((age > handover_seconds)); then
+    [[ $(sed -n 2p <<<"$text") == clipboard ]] && remove_clipboard_file "$(sed -n 4p <<<"$text")"
+    return 0
+  fi
+  printf '%s\n' "$text"
+}
+
+# choose runs Omarchy's file chooser with the arguments given and puts the
+# paths picked in `chosen`. It returns 1 when nothing was chosen, 2 when the
+# chooser did not open, and 3 when its answer is not a list of paths.
+choose() {
+  local picked file status=0
+  picked=$(omarchy-file-select "$@") || status=$?
+  ((status > 1)) && return 2
+  [[ -n $picked ]] || return 1
+  readarray -t chosen <<<"$picked"
+  # The chooser prints each path raw, so a name with a line break would
+  # split in two. Every line must be an existing absolute path, or the
+  # whole pick is refused. So is a line that is also the name of something
+  # with a line break after it: the split may have been there.
+  for file in "${chosen[@]}"; do
+    [[ $file == /* && -e $file && ! -e $file$'\n' ]] || return 3
+  done
+}
+
+menu() {
+  local file status=0
+  local -a chosen
+  case ${1:-} in
+    clipboard)
+      file=$(clipboard_file) || sorry "the clipboard holds no text"
+      hand_over clipboard "$file"
+      ;;
+    file | folder)
+      if [[ $1 == folder ]]; then
+        choose --title "Send a folder with Yonder" --directory || status=$?
+      else
+        choose --title "Send with Yonder" --multiple || status=$?
+      fi
+      case $status in
+        1) exit 0 ;;
+        2) sorry "the file chooser did not open" ;;
+        3) sorry "the file chooser gave an answer that is not a list of paths" ;;
+      esac
+      hand_over files "${chosen[@]}"
+      ;;
+    receive)
+      # A second launch of Yonder only brings the running one's window
+      # forward. Without Yonder, the panel says that it is not installed.
+      if ! command -v yonder >/dev/null 2>&1; then
+        omarchy-shell shell summon "$id" '{}' >/dev/null 2>&1
+      elif command -v uwsm-app >/dev/null 2>&1; then
+        exec uwsm-app -- yonder
+      else
+        exec setsid -f yonder
+      fi
+      ;;
+    *) die "menu needs clipboard, file, folder or receive" ;;
+  esac
+}
+
+case ${1:-} in
+  apply) apply "${2:-}" ;;
+  remove)
+    apply off
+    if target=$(handover_file) && [[ -f $target ]]; then
+      touch -d "@0" -- "$target" && take
+    fi
+    ;;
+  status) menu_mode ;;
+  menu) menu "${2:-}" ;;
+  files)
+    shift
+    hand_over files "$@"
+    ;;
+  clipboard-file)
+    file=$(clipboard_file) || exit $?
+    printf '%s\n' "$file"
+    stat -c %s -- "$file"
+    ;;
+  take) take ;;
+  pick)
+    chosen=()
+    choose --title "${2:-Send with Yonder}" --multiple || exit $?
+    printf '%s\n' "${chosen[@]}"
+    ;;
+  *) die "unknown command '${1:-}'; see the top of this file" ;;
+esac

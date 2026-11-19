@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "id": "org.getyonder.yonder",
+  "name": "Yonder",
+  "version": "0.1.0",
+  "author": "The Yonder Authors",
+  "license": "Apache-2.0",
+  "description": "Send files to your Yonder devices from the Omarchy bar.",
+  "homepage": "https://getyonder.org",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Yonder",
+    "description": "List the devices Yonder can send to, and send files or the clipboard to one.",
+    "category": "Files",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "share": "off"
+    },
+    "schema": [
+      { "key": "share", "type": "enum", "label": "Share and Files", "options": ["off", "beside", "takeover"], "defaultValue": "off", "description": "Where Yonder shows outside the bar: off, beside LocalSend in Omarchy's Share menu and in Files, or in place of LocalSend there. Change it in the panel, which also makes the change." }
+    ]
+  }
+}

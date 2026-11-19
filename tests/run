@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Checks the plugin: the device list's tests and the share helper's (need
+# node; the helper's also python3), and the folder as Omarchy's shell checks
+# it (needs omarchy; passed over where there is none).
+set -uo pipefail
+
+plugin=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+failed=0
+
+node "$plugin/tests/devices.test.mjs" || failed=1
+node "$plugin/tests/share.test.mjs" || failed=1
+
+if command -v omarchy >/dev/null 2>&1; then
+  omarchy plugin validate "$plugin" || failed=1
+else
+  echo "omarchy is not installed here: the folder was not validated"
+fi
+
+exit $failed
